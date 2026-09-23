@@ -1,6 +1,9 @@
+import ctypes
 import enum
 import sys
+from multiprocessing import spawn_context
 
+from pulse.channels import Channels, Counter, Heartbeat
 from pulse.config import Config
 from pulse.lock import AlreadyRunningError, FileLock
 
@@ -28,11 +31,20 @@ def parse_args(argv: list[str], config: Config) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     config = Config()
+
     parse_args(argv if argv is not None else sys.argv[1:], config=config)
+
+    channels = Channels(
+        counter=Counter(ingest=0, etl=0),
+        stop_event=ctypes.c_bool(False),
+        heartbeat=Heartbeat(ingest=0, etl=0),
+    )
 
     try:
         with FileLock(config.data_dir):
-            print("Pulse is running.")
+            from pulse.app import Pulse
+            app = Pulse(channels=channels)
+            app.run()
     except AlreadyRunningError as e:
         print(e, file=sys.stderr)
         return ExitCode.ALREADY_RUNNING
