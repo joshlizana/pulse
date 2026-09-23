@@ -6,11 +6,18 @@ readme = "README.md"
 authors = [
     { name = "Joshua Lizana", email = "josh.lizana@gmail.com" }
 ]
-requires-python = ">=3.13"
-dependencies = []
+requires-python = ">=3.14"
+dependencies = [
+    "atproto>=0.0.72",
+    "duckdb>=1.5.5",
+    "platformdirs>=4.11.12",
+    "streamlit>=1.59.2",
+    "structlog>=26.1.0",
+    "textual>=8.2.8",
+]
 
 [project.scripts]
-pulse = "pulse:main"
+pulse = "pulse.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]
