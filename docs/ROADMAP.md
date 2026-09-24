@@ -29,19 +29,19 @@ Stages run in order too, with one exception noted under
 | 1.3 | `PulseProcess` and its contract | A stub child exits through the stop flag and through EOF, cleaning up each time |
 | 1.4 | TUI shell and the exit paths | Four exit paths return cleanly, terminal intact |
 | 1.5 | Lock handover, bootstrap seam and the startup view | Second instance exits 3 before drawing; startup shows each step; a killed child stops the tree |
-| 1.6 | Three children and synthetic load | Counters climb; the feed scrolls at one cadence across two rates |
+| 1.6 | Four children, synthetic load and the drain | Counters climb; the feed scrolls at one cadence across two rates; a stop delivers every event to load |
 | 1.7 | The shutdown view | `q` shows each child stopping, then the app exits on its own |
-| 1.8 | Lifecycle matrix as tests | The nine criteria pass, repeatedly |
+| 1.8 | Lifecycle matrix as tests | The ten criteria pass, repeatedly |
 | 2.1 | Live tail proving ground | Real events counted from Jetstream v2 with filters applied |
-| 2.2 | Segment writer | Sealed segments sort by seq; graceful exit leaves the spool clean |
-| 2.3 | Cursor resumption and stale cursors | A restart resumes; a stale cursor reports a discontinuity and continues |
+| 2.2 | Handoff and backpressure | A slowed transform stub stalls extract, which reconnects with seq still rising |
+| 2.3 | Stale cursors | A stale cursor reports a discontinuity and the session continues |
 | 2.4 | Real counters and feed | Metrics show live throughput; synthetic mode survives as a flag |
-| 3.1 | DuckLake bootstrap | A cold machine bootstraps once; a warm one skips ahead |
-| 3.2 | Segment to transaction | Segments become queryable tables; a killed transform recovers |
-| 3.3 | Deduplication | A segment replayed twice yields one row per event |
-| 3.4 | Compaction | An hour of ingest leaves bounded file and snapshot counts |
+| 3.1 | Store bootstrap | A cold machine bootstraps once; a warm one skips ahead |
+| 3.2 | Transform | Real events become rows by table; invalid events are dropped and counted |
+| 3.3 | Load and the watermark | Each event lands as it arrives; a killed load resumes at the watermark with no duplicates |
+| 3.4 | WAL checkpointing under a live reader | An hour with the dashboard reading keeps the WAL under a stated ceiling |
 | 4.1 | Streamlit inside a `Process` | The server exits through every stage 1 path, releasing its port |
-| 4.2 | Reading beside a live writer | Dashboard queries land while transform commits |
+| 4.2 | Near-real-time reads | A new event appears on the dashboard within its refresh interval |
 | 4.3 | The URL in the TUI | The TUI shows a URL that opens |
 | 5.1 | Data directory version marker | An older layout is detected and reported with an action |
 | 5.2 | Uninstall on `u` | `u` returns the machine to its pre-install state, bar uv's cache |
@@ -52,9 +52,9 @@ Stages run in order too, with one exception noted under
 
 ## Stage 1 — Walking skeleton
 
-The process tree with trivial contents: the TUI and three children that
-increment counters and emit log lines. Jetstream, DuckLake and Streamlit
-arrive later.
+The process tree with trivial contents: the TUI and four children that increment
+counters, emit log lines, and pass synthetic events down the data queues.
+Jetstream, SQLite and Streamlit arrive later.
 
 The plumbing is the part whose failures present as silence, so it gets built
 alone, while it is the only thing in the system that could be responsible.
@@ -83,12 +83,14 @@ alone, while it is the only thing in the system that could be responsible.
 - `cli.main()` in order: arguments parsed, `Config()` built, the lock taken
 - A dev dependency group with pytest
 
-`Config` grows a field in the milestone that first reads it, working towards
-the finished set in TDD §4.7. The known ones will likely land around 1.5 (log
-directory, join deadlines), 2.1 (collection filters), 2.2 (seal interval) and
-3.1 (cache directory), and others will turn up along the way; each arrives when
-something needs it. Validation in `__post_init__` comes with the first field
-that can hold a bad value.
+`Config` grows a field in the milestone that first reads it, working towards the
+finished set in TDD §4.7. The queue capacities arrived in 1.2. The known ones
+still to come will likely land around 1.5 (log directory, join deadlines), 1.6
+(the drain's quiet interval), 2.1 (collection filters) and 3.1 (cache
+directory), and others will turn up along the way; each arrives when something
+needs it. Validation in `__post_init__` comes with the first field that can hold
+a bad value, which the queue capacities are: a size of zero or less makes a
+queue unbounded.
 
 **Done when** `pulse --help` and `python -m pulse --help` both run from a clean
 checkout, `Config()` prints its paths, a test's `Config()` built after
@@ -104,13 +106,18 @@ debris behind.
 
 ### 1.2 — Channels bundle and counters
 
-- The `ctypes.Structure` with one section per child, so the single-writer rule
+- One section per child — extract, transform, load and dashboard — each its
+  own `ctypes.Structure` class in its own `RawValue`, so the single-writer rule
   is visible in the type
 - Per-section fields: monotonic totals, a heartbeat from `time.monotonic()`, a
-  state value, and the wall-clock shutdown times, stop seen and stopped
-- The stop flag beside the sections, the one field any process may write, with
-  the wall-clock time it was set
-- The bounded log queue and the bounded feed queue
+  state value, and the wall-clock shutdown times, stop seen and stopped; the
+  transform section adds a `dropped` total
+- Load's latency fields: the latest pipeline latency and the latest end-to-end
+  latency, each overwritten at every commit
+- The stop flag, the one shared value any process may write, and beside it the
+  wall-clock time it was set, each in its own `RawValue`
+- Four bounded queues: log and feed, which drop on full, and the two data
+  queues, raw and rows, which block
 - The frozen `Channels` dataclass bundling all of it
 - Creation and initialisation owned by the TUI
 
@@ -171,6 +178,7 @@ second path precisely for it.
   logging configured in `main()` onto the same queue
 - Counter sampling on a timer, rates over a ten-second sliding window, heartbeat
   age shown alongside
+- Pipeline and end-to-end latency shown as sampled
 - **`q`** bound to quit, Textual's **Ctrl+Q** kept; Ctrl+C raising a
   notification that names `q`
 - One handler for SIGINT, SIGTERM and SIGHUP: the first two quit as `q` does,
@@ -178,10 +186,10 @@ second path precisely for it.
 - `try/finally` around `app.run()` in `main()`
 
 **Done when** the TUI runs alone against a hand-filled counters structure and
-hand-queued log records, renders both, and returns cleanly through `q`,
-`kill -INT`, `kill -TERM`, and a closed terminal — leaving a usable terminal
-behind each time. A wrecked terminal after exit is the visible form of a
-`finally` that was skipped, so it doubles as the assertion.
+hand-queued log records, renders both, shows hand-filled latencies, and returns
+cleanly through `q`, `kill -INT`, `kill -TERM`, and a closed terminal — leaving
+a usable terminal behind each time. A wrecked terminal after exit is the visible
+form of a `finally` that was skipped, so it doubles as the assertion.
 
 ### 1.5 — Lock handover, bootstrap seam and the startup view
 
@@ -196,7 +204,7 @@ Inside the app:
 
 - The startup view, driven from a worker thread started in the app's
   `on_mount`: a bootstrap stub occupying the seam that 3.1 fills, then the log
-  directory created with its marker file, then the three children spawned, each
+  directory created with its marker file, then the four children spawned, each
   step shown as it completes, with each child's spawn time and first heartbeat
 - The worker reporting each step as a posted message, leaving widgets to the
   event loop, and owned by the app, so it lives through every screen switch
@@ -205,7 +213,7 @@ Inside the app:
 - One liveness pipe per child, with the TUI closing its own copy of each read
   end
 - The channels bundle and config handed whole to each child
-- The TUI draining both queues all session
+- The TUI draining the log and feed queues all session
 - On EOF, each child cancelling its queue joins and moving its warnings and
   errors from the queue to its own stderr, its log file
 - Warnings and errors drained after the pane is gone printed to the restored
@@ -215,7 +223,7 @@ Inside the app:
 - A child that exits while the stop flag is clear setting off the stop, and
   `main()` returning a nonzero code
 
-**Done when** the startup view shows the bootstrap stub and three sleeping
+**Done when** the startup view shows the bootstrap stub and four sleeping
 stubs coming up, a second `pulse` prints that Pulse is already running and
 exits 3 without drawing a screen, and killing a stub stops the whole tree with
 a reported code. A `kill -9` of the TUI, followed at once by a second `pulse`,
@@ -226,19 +234,40 @@ Signal deaths arrive as negative exit codes, keeping a child's code in the view
 distinct from every code Pulse chooses. A test that kills a child and reads the
 code back is cheap insurance on that.
 
-### 1.6 — Three children and synthetic load
+### 1.6 — Four children, synthetic load and the drain
 
-- The ingest stub generating events at a configurable rate
-- Feed projection to DID, collection and snippet, done inside ingest
-- The feed rate-limited on a time interval inside ingest
-- Transform and dashboard stubs incrementing counters and logging
-- All three honouring both shutdown paths through the shared routine
+- The extract stub generating events at a configurable rate, with ascending
+  seqs and a `rev` minted as a TID from the current time, each stamped with
+  `time.monotonic_ns()` and put one per item onto the raw queue
+- The transform stub passing each event on to the rows queue, and sampling the
+  feed: a projection to DID, collection and snippet, rate-limited on a time
+  interval
+- The load stub counting each event, recording its seq in place of a real
+  watermark, and recording both latencies as though each event were committed
+- The dashboard stub incrementing counters and logging
+- Every `put()` onto a data queue blocking when full
+- The ordered drain on stop: extract puts an end marker, transform and load
+  drain up to it, and each ends its drain on the marker or once the stop flag
+  is set and its input has stayed empty for the quiet interval
+- All four honouring both shutdown paths through the shared routine
 
-**Done when** four processes run, counters climb at the configured rate, the log
-pane carries lifecycle lines, and the feed scrolls at the same cadence whether
-the generator runs at 200/sec or 2000/sec. That equality is the whole point of
-the generator: it is how you learn whether the sampling window and the display
-pump are tuned sensibly, with the network uninvolved.
+**Done when** five processes run, counters climb at the configured rate,
+latency shows in the TUI and rises when a stub is slowed, the log pane carries
+lifecycle lines, and the feed scrolls at the same cadence
+whether the generator runs at 200/sec or 2000/sec. That equality is the whole
+point of the generator: it is how you learn whether the sampling window and the
+display pump are tuned sensibly, with the network uninvolved.
+
+Two drain checks are part of the gate:
+
+1. `q` delivers every event extract generated before the stop to the load
+   stub, whose final seq matches extract's last.
+2. A `kill -9` of the extract stub still lets transform and load finish, their
+   drains ending on the quiet interval.
+
+A missing marker presents as a stage that never stops draining, with every row
+of the view waiting on it, so the second check guards the rule that ends the
+wait.
 
 The generator keeps earning afterwards as a test fixture and as an offline demo
 mode, so it is built to survive stage 2.
@@ -271,12 +300,12 @@ debugging tool for 1.8: a flaky criterion shows which row stalled.
 
 ### 1.8 — Lifecycle matrix as tests
 
-The nine criteria below each spawn a real tree with `HOME` pointed at
+The ten criteria below each spawn a real tree with `HOME` pointed at
 `tmp_path` and the XDG variables cleared, and assert that every pid in it is
 gone afterwards, the resource tracker that `multiprocessing` starts under
 `spawn` included:
 
-1. Four processes run; counters climb; logs scroll
+1. Five processes run; counters climb; logs scroll
 2. `q` exits every process in the tree, with every row of the shutdown view
    complete
 3. `kill -INT` on the TUI exits every process in the tree
@@ -290,14 +319,18 @@ gone afterwards, the resource tracker that `multiprocessing` starts under
 8. A killed child is reported in the shutdown view, and the tree stops
 9. A second instance started while a killed TUI's children wind down is
    refused with exit code 3
+10. A graceful stop delivers every event extract received before it to load
 
-**Done when** all nine pass, and keep passing across repeated runs. Repetition
+**Done when** all ten pass, and keep passing across repeated runs. Repetition
 is the gate: teardown races are probabilistic, so a flake here is a finding
 about the design.
 
 Criterion 8 kills a child while it is busy, since the lock hazard that retired
-the stop `Event` (TDD §5) sits on the busy path. Criterion 5 checks cleanup
-alongside pids, since children killed by SIGHUP also leave no pids behind.
+the stop `Event` (TDD §5) sits on the busy path. Killing load is the harder
+variation: transform then stops without exiting, its last item unflushed onto a
+queue nobody reads, until the join deadline escalates. Criterion 5 checks
+cleanup alongside pids, since children killed by SIGHUP also leave no pids
+behind.
 
 A `kill -9` of the TUI leaves the resource tracker to remove the queues' named
 semaphores, and it says so on the terminal it inherited. That warning is
@@ -305,15 +338,16 @@ expected.
 
 ---
 
-## Stage 2 — Ingest
+## Stage 2 — Extract
 
-Replace the synthetic generator with a real Jetstream v2 live tail.
+Replace the synthetic generator with a real Jetstream v2 live tail, feeding the
+stage 1 transform and load stubs.
 
 ### 2.1 — Live tail proving ground
 
 - The `atproto` Jetstream client connected to a public v2 instance
 - Collection filters applied server-side
-- Messages counted and a handful logged, with the disk uninvolved
+- Messages counted and a handful logged, with the queues uninvolved
 
 **Done when** a short run counts real events with filters visibly narrowing the
 stream. Confirming the v2 endpoint and parameter names against the current API
@@ -321,36 +355,34 @@ belongs here, while this is the only moving part. The installed SDK (atproto
 0.0.72) speaks v2 alone and dials `wss://jetstream.us-east.bsky.network/xrpc`
 by default.
 
-### 2.2 — Segment writer
+### 2.2 — Handoff and backpressure
 
-- The open JSONL segment, named by the zero-padded seq of its first event
-- Sealing every 5 seconds: fsync, then atomic rename into the spool
-- Sealing on both shutdown paths, inside the shared teardown routine
-- A leftover pre-rename file deleted at startup
+- The handler putting each message on the raw queue
+- The handler waiting on a full queue, and keeping every message it receives
+- The end marker put on both shutdown paths, inside the shared teardown
+  routine
+- Messages at or below a watermark skipped, with the watermark supplied by hand
+  until 3.3 reads a real one
 
-**Done when** a run produces sealed segments whose names sort by seq, a graceful
-exit leaves the spool holding sealed segments alone, and a `kill -9` leaves at
-most one partial file under its pre-rename name, which the next start deletes.
+**Done when** a transform stub slowed to a crawl holds the raw queue at
+capacity, extract's memory stays flat, the SDK reconnects after Jetstream drops
+the slow consumer, and seq keeps rising across the reconnect with no message
+lost between the handler and the queue.
 
-The rename is what makes a segment either invisible or complete, so the
-transformer always sees whole files, and the fsync ahead of it carries that
-through power loss. A `kill -9` discards the open segment, up to 5 seconds of
-events, which 2.3 re-fetches.
+The SDK advances its cursor before the handler runs, so a handler that
+discarded a message on a full queue would lose it for good, with nothing in the
+logs to say so. This gate is where that rule gets proven while extract is the
+only real stage.
 
-### 2.3 — Cursor resumption and stale cursors
+### 2.3 — Stale cursors
 
-- The resume cursor derived from sealed data: the newest segment's last seq, or
-  the store's highest once transform empties the spool
-- Reconnection within a session handled by the SDK, which drops the redelivered
-  event itself
-- The host recorded beside the data, and a change of host treated as a stale
-  cursor
+- The host recorded beside the watermark, and a change of host treated as a
+  stale cursor
 - `JetstreamCursorTooOldError` caught: the cursor discarded, the discontinuity
   reported to the TUI, the subscription resumed from the live tip
 
-**Done when** a restart resumes from the newest sealed seq and re-fetches what a
-`kill -9` discarded, and a hand-written stale cursor produces a discontinuity
-report in the TUI followed by a session that carries on from the present.
+**Done when** a hand-written stale cursor produces a discontinuity report in the
+TUI followed by a session that carries on from the present.
 
 Writing an old cursor by hand is the practical way to reach this path at
 startup, since the natural route requires leaving Pulse closed for longer than
@@ -361,7 +393,7 @@ reaches that route by raising the error from a stubbed client.
 ### 2.4 — Real counters and feed
 
 - Counters wired to real throughput
-- The feed carrying projected real events
+- The feed carrying real events, projected by the transform stub
 - The synthetic generator moved behind a flag, keeping it available
 
 **Done when** the metrics pane shows live event rates, the feed carries real
@@ -369,71 +401,80 @@ posts, and the synthetic flag still produces the stage 1 behaviour.
 
 ---
 
-## Stage 3 — Transform
+## Stage 3 — Transform and load
 
-### 3.1 — DuckLake bootstrap
+### 3.1 — Store bootstrap
 
-- Both extensions, `ducklake` and `sqlite_scanner`, installed with
-  `extension_directory` pinned into the cache directory
-- `extension_directory` and `temp_directory` set on every connection, in every
-  process
+- The `sqlite_scanner` extension installed with `extension_directory` pinned
+  into the cache directory
+- `extension_directory` and `temp_directory` set on every DuckDB connection
 - The cache directory created, with its marker file for uninstall
-- The SQLite catalog created
-- The spool directory created, with `done/` and `quarantine/`
+- The SQLite database created in WAL mode, its tables declared `STRICT`, with
+  the one-row watermark table
+- The watermark read through `sqlite3` and handed to extract at construction
 - All of it in the TUI's startup worker, under the lock, before any child exists
 
 **Done when** a cold machine bootstraps in a single run, a second run finds
-everything present and proceeds, and the extensions sit in Pulse's own cache
+everything present and proceeds, and the extension sits in Pulse's own cache
 directory with `~/.duckdb` absent afterwards. Pinning the directory is what
 keeps 5.2's uninstall complete, so a test that asserts the location earns its
 place.
 
-### 3.2 — Segment to transaction
+### 3.2 — Transform
 
-- One sealed segment loaded per transaction
-- The segment moved into `done/` on commit, and `done/` pruned by age
-- Quarantine for a segment that fails to load
+- Each event validated against Pulse's pydantic models, then normalised into
+  rows by table
+- Values cast into the store's domain: strings that encode to UTF-8, integers
+  inside 64 bits, timestamps inside the ranges DuckDB reads
+- An invalid event dropped, counted in `dropped`, and logged with its reason
+- Each rows item carrying its event's seq and receipt stamp, a dropped event's
+  with no rows
+- A commit event's `rev` decoded from its TID into microseconds, carried to
+  load; an event with no `rev`, or one that fails to decode, loses only its
+  end-to-end latency
+- Feed sampling carried over from the stub
 
-**Done when** segments land in queryable tables, a transform killed
-mid-transaction reprocesses the surviving segment on restart, and a deliberately
-malformed segment moves to quarantine while the pipeline carries on.
+**Done when** a real stream becomes rows by table, a known TID decodes to its
+time, and hand-fed invalid events — a missing field, an escaped lone surrogate,
+an out-of-range timestamp — are each dropped and counted while the rest flow on.
 
-Crash recovery here is a directory listing: any segment in the spool itself is
-unprocessed. That property holds only while commit-then-move stays in that
-order, which the kill test is checking.
+The lone surrogate is the case worth keeping as a test: it passes as a Python
+`str`, so only the cast catches it, and missed here it would raise in load's
+commit and end the session.
 
-### 3.3 — Deduplication
+### 3.3 — Load and the watermark
 
-- The idempotency key is Jetstream's seq, which identifies an **event**
-- Deduplication applied once, at the DuckLake write, as an anti-join limited to
-  the segment's seq range, since DuckLake rejects `PRIMARY KEY` and `UNIQUE`
-  constraints
+- Each event committed as it arrives: its rows in every table and the
+  watermark in **one** transaction
+- `synchronous=NORMAL`, with the WAL making each commit visible to readers at
+  once
+- Both latencies recorded once `COMMIT` returns: pipeline latency from the
+  receipt stamp, end-to-end latency from the decoded `rev`
+- A commit failing on the environment raising, and ending the session
 
-**Done when** a segment replayed twice produces one row per event, the first
-event of a resumed session lands once, and a create followed later by an update
-of the same record remains two rows sharing one `at://` URI.
+**Done when** each event is queryable as soon as load has it, the TUI shows real
+pipeline and end-to-end latency, and a `kill -9` of load mid-run is followed by
+a restart that resumes at the watermark, with the replayed events landing once
+and the event at the watermark itself landing once.
 
-The two keys answer different questions, which is why the gate checks both: the
-`at://` URI identifies a *record* across its lifetime and serves as a grouping
-dimension for queries, while the seq identifies the *event* and is exactly what
-a replay repeats. [TDD §4.4](TDD.md) carries the full reasoning.
+The one-transaction rule is what the kill test checks: an event's rows
+committed apart from the watermark would leave the two disagreeing after a
+crash between them.
 
-The seq-range limit keeps the anti-join's cost flat as the store grows, so a
-write late in a long run is worth timing against one early in it.
+### 3.4 — WAL checkpointing under a live reader
 
-### 3.4 — Compaction
+- SQLite's automatic checkpoint left on, folding the log back into the database
+  once it passes 1,000 pages
+- The WAL's size shown in the TUI beside the counters
+- A reader holding a read transaction open, used as the failing case
 
-- Maintenance in three steps on a schedule: `ducklake_merge_adjacent_files`,
-  then `ducklake_expire_snapshots`, then `ducklake_cleanup_old_files` with a
-  grace period longer than the slowest dashboard query
-- A decision on which process owns that schedule, closing one of the TDD's open
-  questions
+**Done when** an hour of load with a reader querying throughout keeps the WAL
+under a stated ceiling, and a reader held open deliberately makes the WAL's
+size climb in the TUI.
 
-**Done when** an hour of ingest leaves file and snapshot counts under stated
-ceilings. Segment-sized commits produce roughly 720 of each an hour. Merging
-alone raises the file count, because the originals stay on disk until their
-snapshots expire and cleanup runs (TDD appendix). Both ceilings are needed to
-show the whole sequence is running.
+A checkpoint can only fold in what no open read still needs, so a reader that
+never lets go grows the WAL a commit at a time, with no error anywhere. The
+deliberate case proves the TUI shows it.
 
 ---
 
@@ -456,13 +497,18 @@ A held port after teardown is the tell here, and it is the exact failure that
 running Streamlit as a `subprocess` would have made permanent. Checking the port
 is free and catches it immediately.
 
-### 4.2 — Reading beside a live writer
+### 4.2 — Near-real-time reads
 
-- A read path onto DuckLake while transform commits
-- SQLite catalog concurrency understood and settled
+- A DuckDB connection attaching the database read-only through `sqlite_scanner`
+- Short reads, one query at a time, holding nothing open between refreshes
+- The page refreshing itself on an interval
 
-**Done when** the dashboard queries the store over a sustained run with
-transform committing throughout, and the catalog serves both for the duration.
+**Done when** an event committed by load appears on the dashboard within one
+refresh interval, over a sustained run with load committing throughout, and the
+WAL stays under 3.4's ceiling while the dashboard runs.
+
+The refresh interval is the latency an operator sees, since each commit reaches
+DuckDB's next query in about a millisecond (TDD appendix).
 
 ### 4.3 — The URL in the TUI
 
@@ -533,14 +579,15 @@ sees.
 ## Prerequisites
 
 The analytical data model — which collections are subscribed to, the table
-shapes, what the dashboard presents — is designed separately, and two milestones
-consume it:
+shapes, what the dashboard presents — is designed separately, and three
+milestones consume it:
 
 - **2.1** needs the collection list, since the filters are what it applies
-- **3.2** needs the table shapes, since the loader writes into them
+- **3.1** and **3.2** need the table shapes, since bootstrap creates the tables
+  and transform normalises into them
 
 A provisional collection list is enough to reach 2.4, so the design can run
-alongside stage 2 as long as it lands before 3.2.
+alongside stage 2 as long as it lands before 3.1.
 
 ---
 
@@ -556,5 +603,5 @@ Held open deliberately, listed so the reasoning survives:
   a control channel justifies itself.
 - **Platforms other than Linux** — macOS would need its `spawn`, clock and
   signal behaviour re-verified; native Windows would require replacing
-  `fcntl.flock` and the fd-level readiness integration in ingest's event loop.
+  `fcntl.flock` and the fd-level readiness integration in extract's event loop.
   WSL2 is Linux and needs neither.

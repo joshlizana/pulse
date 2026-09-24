@@ -1,4 +1,5 @@
 import fcntl
+import multiprocessing.queues
 import os
 import signal
 
@@ -57,9 +58,12 @@ def lock_is_free(data_dir):
 
 
 def is_shared(obj):
-    """Whether a ctypes object lives in multiprocessing shared memory.
+    """Whether an object can reach a spawned child as a `Process` argument.
 
-    `multiprocessing.sharedctypes` attaches the shared block as `_wrapper`, and
-    pickling an object for a spawned child relies on it.
+    A multiprocessing queue always can. A ctypes object can only when it lives
+    in multiprocessing shared memory: `multiprocessing.sharedctypes` attaches the
+    shared block as `_wrapper`, and pickling the object for a child relies on it.
     """
+    if isinstance(obj, multiprocessing.queues.Queue):
+        return True
     return hasattr(obj, "_wrapper")

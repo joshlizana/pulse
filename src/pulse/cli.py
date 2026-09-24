@@ -3,7 +3,7 @@ import enum
 import multiprocessing
 import sys
 
-from pulse.channels import Channels, Counter, Heartbeat
+from pulse.channels import Channels, Extract, Transform, Load, Dashboard
 from pulse.config import Config
 from pulse.lock import AlreadyRunningError, FileLock
 
@@ -38,9 +38,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with FileLock(config.data_dir):
             channels = Channels(
-                counter=ctx.RawValue(Counter),
+                extract=ctx.RawValue(Extract),
+                transform=ctx.RawValue(Transform),
+                load=ctx.RawValue(Load),
+                dashboard=ctx.RawValue(Dashboard),
                 stop_event=ctx.RawValue(ctypes.c_bool),
-                heartbeat=ctx.RawValue(Heartbeat),
+                stop_time=ctx.RawValue(ctypes.c_double),
+                logs=ctx.Queue(config.log_queue_maxsize),
+                feed=ctx.Queue(config.feed_queue_maxsize),
+                raw=ctx.Queue(config.raw_queue_maxsize),
+                rows=ctx.Queue(config.rows_queue_maxsize),
             )
             from pulse.app import Pulse
             app = Pulse(channels=channels)

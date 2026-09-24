@@ -13,10 +13,11 @@ Bluesky's public rendering of that firehose as plain JSON, filtered server-side,
 delivered over a websocket. Two public v2 instances serve the full network, and
 live-tail consumption is unauthenticated.
 
-Pulse observes that stream, lands it on disk, transforms it into an analytical
-store, and presents it. It runs as a local single-user tool, installed and
-launched with one `uvx` command, and holds its lifetime to a single session: it
-starts when the operator opens it and stops when they close it.
+Pulse observes that stream, carries it through a three-stage ETL pipeline into
+an analytical store, and presents it. It runs as a local single-user tool,
+installed and launched with one `uvx` command, and holds its lifetime to a
+single session: it starts when the operator opens it and stops when they close
+it.
 
 This document covers the process architecture, the channels between processes,
 the lifecycle contract, and the data path. The analytical data model — which
@@ -33,13 +34,16 @@ is designed separately.
   machine to events on screen, resolving its own dependencies and storage.
 - **The pipeline is legible while it runs.** Each stage reports throughput and
   liveness, so the operator can see which stage is doing what.
-- **Ingested data lands somewhere queryable.** The analytical store is a real
-  lakehouse that outlives the session and answers SQL.
+- **Ingested data lands somewhere queryable.** The store is a SQLite database
+  that outlives the session and answers SQL, read for analysis through DuckDB.
+- **Data reaches the dashboard in near real time.** Each event is committed as
+  it arrives and visible to readers on commit, so the dashboard's refresh
+  interval is the delay an operator sees.
 - **The process tree starts and stops cleanly**, through every exit path
   available to an operator, including abrupt ones.
 - **Ordinary laptop resources suffice.** Bounded memory and CPU at firehose
-  rates, and a bounded spool. The store grows with observed history; its
-  retention is an open question (§7).
+  rates. The store grows with observed history; its retention is an open
+  question (§7).
 
 ### Non-goals
 
@@ -81,36 +85,38 @@ Jetstream v2  ── public websocket, JSON, unauthenticated live tail
         ▼
 ┌──────────────────────── Pulse (one machine, one session) ───────────────────┐
 │                                                                             │
-│   ingest ──▶ JSONL spool ──▶ transform ──▶ DuckLake ──▶ dashboard           │
-│      │        (5s segments)      │         (Parquet +       (Streamlit)     │
-│      │                           │          SQLite catalog)      │          │
-│      └───────── counters, logs ──┴──────────────────────────────┐│          │
-│                                                                 ▼▼          │
-│                                                          TUI (Textual)      │
-└─────────────────────────────────────────────────────────────────┬───────────┘
-                                                                  ▼
-                                                              operator
+│   extract ──▶ transform ──▶ load ──▶ SQLite ──▶ dashboard                   │
+│      │    raw     │    rows  │      (WAL mode) (Streamlit)                  │
+│      │            │          │                      │                       │
+│      └────────────┴──────────┴ counters, logs, feed┐│                       │
+│                                                    ▼▼                       │
+│                                              TUI (Textual)                  │
+└────────────────────────────────────────────────────┬────────────────────────┘
+                                                     ▼
+                                                 operator
 ```
 
-Data moves left to right through files. Observability moves upward through
-shared memory and queues. The operator interacts with the TUI, which owns the
-lifetime of everything below it.
+Data moves left to right through two bounded queues and into SQLite.
+Observability moves upward through shared memory and queues. The operator
+interacts with the TUI, which owns the lifetime of everything below it.
 
 ### Process tree
 
 ```
 TUI (Textual)
-├── ingest      Jetstream v2 live tail → JSONL segments
-├── transform   sealed segment → DuckLake
-└── dashboard   Streamlit server reading DuckLake
+├── extract     Jetstream v2 live tail → one message per item
+├── transform   validate, normalise, cast → each event's rows by table
+├── load        each event's rows and the watermark → SQLite, one transaction
+└── dashboard   Streamlit server querying SQLite through DuckDB
 ```
 
 | Process | Owns |
 |---|---|
-| **TUI** | The view, the lifetime, the channel objects, and the data directory: the instance lock, the bootstrap, and the three children. |
-| **ingest** | One Jetstream live-tail connection and the open JSONL segment. |
-| **transform** | Loading sealed segments into DuckLake and maintaining the catalog. |
-| **dashboard** | The Streamlit server. |
+| **TUI** | The view, the lifetime, the channel objects, and the data directory: the instance lock, the bootstrap, and the four children. |
+| **extract** | One Jetstream live-tail connection, handing each message to the raw queue. |
+| **transform** | Validating each event, normalising it into rows, casting them into DuckDB's types, and sampling the feed. |
+| **load** | Committing each event's rows and the watermark to SQLite, the store's only writer. |
+| **dashboard** | The Streamlit server, reading the store through a DuckDB connection that attaches it read-only. |
 
 `multiprocessing` adds one process of its own under `spawn`: the resource
 tracker, which removes named semaphores left behind by a process that died
@@ -141,13 +147,14 @@ Every child is a `PulseProcess`: a `multiprocessing.Process` subclass whose
 
 Each child receives a uniform constructor: the channels bundle, its own liveness
 pipe end, a duplicate of the instance lock's descriptor (§4.3), and the config.
+Extract also receives the watermark to resume from (§4.4).
 
 #### Terminal signals
 
 Spawned processes stay in the TUI's process group, and a closing terminal
-delivers SIGHUP to the whole group: an interactive shell resends it to every
-job before exiting. A child taking the default action would die without its
-`finally`, abandoning its open segment or its transaction while the tree
+delivers SIGHUP to the whole group: an interactive shell resends it to every job
+before exiting. A child taking the default action would die without its
+`finally`, abandoning a message in flight or its transaction while the tree
 appeared to exit cleanly.
 
 `PulseProcess.run()` therefore ignores SIGINT and SIGHUP before anything else.
@@ -157,23 +164,31 @@ child can still be terminated deliberately (§4.3).
 
 ### 4.2 Channels
 
-Five channels, separated by frequency and by behaviour under pressure.
+Seven channels, separated by frequency and by behaviour under pressure.
 
 | Channel | Kind | Direction | Carries | Under pressure |
 |---|---|---|---|---|
 | **Counters** | `ctypes.Structure` in shared memory, lock-free | child writes, TUI reads | totals, heartbeat, state | Sampled; each writer proceeds at its own pace |
-| **Stop** | Flag in the same shared memory, lock-free | any process → all | The graceful shutdown signal | Written once, polled; a dead writer holds nothing |
+| **Stop** | Flag in shared memory, lock-free | any process → all | The graceful shutdown signal | Written once, polled; a dead writer holds nothing |
 | **Liveness** | `Pipe(duplex=False)` | TUI holds write end | Its closure is the message | Silent by design |
 | **Logs** | bounded `Queue` | all → TUI | structlog events as JSON, in `LogRecord`s via `QueueHandler` | Drops on full, through `put_nowait` |
-| **Feed** | bounded `Queue` | ingest → TUI | Sampled event projections | Drops on full |
+| **Feed** | bounded `Queue` | transform → TUI | Sampled event projections | Drops on full |
+| **Raw** | bounded `Queue` | extract → transform | Jetstream messages with their receipt stamps, one per item | Blocks on full: the pipeline's backpressure (§4.4) |
+| **Rows** | bounded `Queue` | transform → load | One event's rows by table, with its seq and latency stamps | Blocks on full |
 
 #### Counters carry the hot path
 
-Counters live in a `ctypes.Structure` with one section per child, so the
-single-writer rule is visible in the type. The TUI samples at its own rate;
-sampling decouples the two paces, letting ingest write as fast as events arrive
-whatever speed the TUI reads at. This protects the cursor, since ingest falling
-behind its websocket risks a gap past the lookback window.
+Counters live in shared memory as one section per child, each its own
+`ctypes.Structure` class in its own `RawValue`, so the single-writer rule is
+visible in the type: a child writes to its own section and nowhere else. The TUI
+samples at its own rate; sampling decouples the two paces, letting each stage
+write as fast as events arrive whatever speed the TUI reads at, so rendering
+stays out of the pipeline's way. Transform's section also carries a `dropped`
+total, for events that fail validation (§4.4).
+
+Load's section also carries latency (§4.4): the latest event's latency, in
+seconds, overwritten at each commit. The TUI samples it like any other field,
+so each refresh shows the latency of whichever event committed last.
 
 Children increment monotonic totals and write a heartbeat from
 `time.monotonic()`. The TUI derives rates from successive samples over a
@@ -200,11 +215,11 @@ memory.
 
 #### The stop flag
 
-The stop signal is a single field beside the counter sections, and the one field
-in the structure with more than one writer. Any process may set it, and every
-write stores the same value, so writers agree without a lock. Beside it sits the
-wall-clock time it was set, written by whoever sets it. Concurrent setters write
-times moments apart, and whichever lands last is the one shown.
+The stop signal is a `c_bool` in its own `RawValue`, and the one shared value
+with more than one writer. Any process may set it, and every write stores the
+same value, so writers agree without a lock. Beside it, in a second `RawValue`,
+sits the wall-clock time it was set, written by whoever sets it. Concurrent
+setters write times moments apart, and whichever lands last is the one shown.
 
 Each child's watchdog thread waits on its liveness pipe with a short timeout and
 reads the flag each time it wakes. One thread thereby observes both signals, and
@@ -225,17 +240,27 @@ passed to it, so a second holder takes a mistake in what the TUI passes. That
 failure presents as an absence, which is why the stop flag doubles as a second
 path (§4.3).
 
-#### Two queues, separately bounded
+#### The log and feed queues, separately bounded
 
 Logs and the sampled feed hold separate capacity, so sampled post text, which is
-decorative, leaves error records, which are load-bearing, untouched.
+decorative, leaves error records, which are load-bearing, untouched. Both drop
+on full: the TUI reads them, and nothing in the pipeline waits on it.
 
-The feed is rate-limited **in ingest**, on a time interval, so the scroll
-cadence stays constant whether the firehose runs at 200/sec or 2000/sec. Ingest
-projects each sample to a DID, a collection and a snippet before it crosses the
-boundary. Commit events carry the author's DID and no handle; handles arrive
-only on identity events, when one changes. Showing handles would mean resolving
-them against the network, which stays out of ingest's hot path (§7).
+The feed is rate-limited **in transform**, on a time interval, so the scroll
+cadence stays constant whether the firehose runs at 200/sec or 2000/sec.
+Transform holds each event validated and normalised, so it projects each sample
+to a DID, a collection and a snippet before it crosses the boundary. Commit
+events carry the author's DID and no handle; handles arrive only on identity
+events, when one changes. Showing handles would mean resolving them against the
+network, which stays out of the pipeline's hot path (§7).
+
+#### The data queues
+
+The raw and rows queues carry the pipeline itself (§4.4), one event per item,
+so no event waits on a batch filling around it. Each item pays a pickle and a
+pipe write per hop; a plain dict crosses at about 112,000 items a second
+(appendix), well above firehose rates. Both queues block when full, which is how
+a slow stage slows the one upstream of it.
 
 #### Queues and exit
 
@@ -243,12 +268,19 @@ A queue write passes through a feeder thread in the writing process, and that
 process exits only once the thread has flushed its buffer into the pipe. A
 reader that stops reading can therefore hold a writer's exit indefinitely.
 
-While the TUI lives, it drains both queues for its whole life, including while
-the shutdown view waits on the children. Once the TUI has died, no reader will
-ever return, so a child seeing EOF calls `cancel_join_thread()` on both queues
-before tearing down. Its exit then skips the flush, and what it drops has no
-one left to read it. Where an orphaned child's log records go instead is covered
-in §4.8.
+While the TUI lives, it drains the log and feed queues for its whole life,
+including while the shutdown view waits on the children. The data queues are
+read by siblings, which drain them through a graceful stop (§4.3). A stage whose
+downstream neighbour has died therefore stops without exiting, its last item
+unflushed, until its join deadline escalates; the shutdown view shows that gap
+directly.
+
+Once the TUI has died, no reader of the log and feed queues will ever return, so
+a child seeing EOF calls `cancel_join_thread()` on every queue it writes before
+tearing down, the data queues included. Its exit then skips the flush. A log
+record it drops has no one left to read it, and an event it drops sits past the
+watermark, for the next session to re-fetch (§4.4). Where an orphaned child's
+log records go instead is covered in §4.8.
 
 #### Crossing the boundary
 
@@ -276,12 +308,13 @@ Then `app.run()`, and the startup view, driven from a worker thread started in
 `on_mount`:
 
 4. Bootstrap under the lock: the cache directory with its marker file,
-   extensions, catalog, spool directory, each step shown as it completes
+   the `sqlite_scanner` extension, the database, the watermark read, each step
+   shown as it completes
 5. The log directory created, with its marker file, since the children's stream
    redirection is its first use
-6. One liveness pipe per child, and the three children spawned, each holding a
-   duplicate of the lock's descriptor. Each child's row shows when it was
-   spawned and when its first heartbeat arrived.
+6. One liveness pipe per child, and the four children spawned, each holding a
+   duplicate of the lock's descriptor, and extract holding the watermark. Each
+   child's row shows when it was spawned and when its first heartbeat arrived.
 7. The worker ends, and the main view takes over: counters sampled, panes
    rendered, children supervised from the sampling timer
 
@@ -349,12 +382,25 @@ the worker and read its messages without a screen.
 
 #### Graceful shutdown
 
-The TUI sets the stop flag and opens the shutdown view. Children finish their
-current unit of work and exit — ingest seals its open segment, transform
-completes its in-flight transaction. The TUI waits on each child from the view,
-draining both queues, and exits the app once all three have gone. The lock
+The TUI sets the stop flag and opens the shutdown view. The pipeline stops
+upstream first, and each stage passes the stop down the data queues:
+
+1. Extract stops its subscription and puts an end marker on the raw queue.
+2. Transform drains the raw queue up to the marker and passes the marker on.
+3. Load drains the rows queue up to the marker, committing each event as it
+   comes.
+
+The last commit therefore covers the last event extract received. The dashboard
+stops on the flag alone. The TUI waits on each child from the view, draining the
+log and feed queues, and exits the app once all four have gone. The lock
 releases once the TUI and every child have closed their copies of its
 descriptor.
+
+A marker can fail to arrive: extract killed before it sends one, or an item
+dropped in an orphan teardown (below). Transform and load therefore end their
+drain on the marker, or once the stop flag is set and their input has stayed
+empty for the configured quiet interval. Whatever never committed sits past the
+watermark, and the next session re-fetches it.
 
 #### The shutdown view
 
@@ -389,9 +435,9 @@ child killed outright leaves its "stopped" time blank, so the gap points at the
 child that died or hung. The log pane stays visible beneath the rows, so each
 child's teardown lines arrive alongside its times.
 
-The view keeps the event loop free. On the sampling timer it checks each
-child's sentinel, applies the join deadlines, and drains both queues, as the TUI
-does all session. Once every child has exited, the view shows the total
+The view keeps the event loop free. On the sampling timer it checks each child's
+sentinel, applies the join deadlines, and drains the log and feed queues, as the
+TUI does all session. Once every child has exited, the view shows the total
 shutdown time, holds briefly so the final state can be read, and exits the app.
 The `finally` in `main()` then finds the children already down.
 
@@ -402,10 +448,11 @@ a signal.
 
 #### Join deadlines
 
-Every join carries a deadline longer than the slowest unit of work, a transform
-transaction. A child that misses its deadline is sent SIGTERM, then SIGKILL, and
-is reported. The deadlines bound unanticipated hangs, so a teardown that goes
-wrong still ends.
+Every join carries a deadline longer than the slowest part of a graceful stop:
+draining full data queues. Queue capacities are sized to keep that drain
+short. A child that misses its deadline is sent SIGTERM, then
+SIGKILL, and is reported. The deadlines bound unanticipated hangs, so a teardown
+that goes wrong still ends.
 
 #### Orphan teardown
 
@@ -523,37 +570,148 @@ releases on process death of any kind, so a stale lock resolves itself.
 
 ### 4.4 Data path
 
-#### Ingest
+Three processes carry the data, one for each step of ETL, joined by the two
+bounded data queues (§4.2), one event at a time:
+
+```
+Jetstream ──▶ extract ──raw──▶ transform ──rows──▶ load ──▶ SQLite ──▶ dashboard
+```
+
+An event is committed as it arrives, and a commit is visible to every reader at
+once (SQLite and the dashboard's reader, below). The pipeline adds microseconds
+per event, so how fresh the dashboard looks is set by its refresh interval.
+
+#### Extract
 
 One Jetstream v2 live-tail connection through the `atproto` SDK,
-unauthenticated. Events append to an open JSONL segment, **sealed every 5
-seconds: fsync, then atomic rename**. Segments are named by the seq of their
-first event, zero-padded to a fixed width, so names sort as numbers and ordering
-holds across restarts.
+unauthenticated. The SDK parses each frame into a message model, and extract's
+handler stamps it with `time.monotonic_ns()` and puts the pair on the raw
+queue.
 
-Sealing by rename means a segment is either invisible or complete, and the fsync
-ahead of it carries that guarantee from process death through to power loss. The
-transformer sees whole files.
+Extract starts from the watermark the TUI hands it (below), and skips any
+message at or below it.
 
-#### The cursor
+#### Backpressure
 
-The cursor is Jetstream's `seq`, a monotonic per-event sequence number. Pulse
-keeps no separate cursor file. The resume position is the highest seq in sealed
-data: the newest segment in the spool, or the store when the spool holds none.
+A `put()` onto a full queue blocks, so a slow load stalls transform, and a
+stalled transform stalls extract inside its handler. The handler runs within
+the SDK's receive loop, so extract stops reading the websocket. Jetstream drops
+a consumer that falls too far behind (`JetstreamConsumerTooSlowError`), and the
+SDK reconnects on its own, with exponential backoff capped at 64 seconds, from
+its cursor.
 
-Resuming there re-fetches the events of a segment that was still open when the
-process died, as long as the restart falls inside the lookback window. The
-pre-rename file a `kill -9` leaves behind is therefore deleted at startup rather
-than salvaged.
+The SDK advances that cursor as each frame is decoded, before the handler runs,
+so a reconnect resumes after every message the handler was given. The handler
+therefore keeps every message it receives, and waits on a full queue: a message
+it discards sits behind the cursor, and no reconnect fetches it again.
 
-The server replays inclusively from the cursor, so the first event of a resumed
-session is one already stored, and deduplication absorbs it. Within a session
-the SDK tracks the cursor itself and drops the event each reconnect redelivers.
+A stall's backlog therefore waits upstream, in Jetstream's retention, and a
+stall is safe for as long as it stays inside the lookback window. The blocking
+chain the one-pipe design was rejected for (§5) ended in the TUI's rendering;
+this chain ends in a replayable source, and the TUI stays outside it, since the
+log and feed queues drop on full.
 
-A seq is assigned by the Jetstream instance serving the connection, and whether
-the two public instances number alike is unconfirmed (§7). The host that
-produced the data is recorded in the data directory. A session configured for a
-different host treats its cursor as stale.
+#### Transform
+
+Transform validates each event against Pulse's own pydantic models, normalises
+it into rows for its tables, and casts every value into the domain the store
+accepts. The table shapes belong to the analytical data model (§1).
+
+The cast targets the store's types where they are narrower than Python's. A
+string must encode to UTF-8, which an escaped lone surrogate such as `\ud800`
+decodes into a valid Python `str` and then fails, as a `UnicodeEncodeError` when
+`sqlite3` binds it. An integer must fit SQLite's 64 bits, or binding raises
+`OverflowError`. Timestamps must fall inside the ranges DuckDB reads. Pydantic's
+defaults check the Python side, so these are validators on the output models.
+With them, load receives rows already valid for its schema, and the STRICT
+tables below are a second line.
+
+An event that fails validation or casting is dropped, counted in transform's
+`dropped` total, and logged with its reason. Malformed events are vanishingly
+rare in practice: hundreds of millions of these records have been processed
+without one. The counter earns its place against upstream schema drift, which
+would move the drop rate from zero to most of a collection at once.
+
+Each rows item carries its event's seq. A dropped event sends a rows item with
+its seq and no rows, so the watermark moves past an event that will never load.
+
+#### Load
+
+Load commits each event as it arrives, in **one transaction** covering the
+event's rows in every table and the watermark, so the tables and the watermark
+agree after any crash: a crash before the commit leaves the watermark behind
+the event, and a crash after leaves both in place. A transaction of two inserts
+and the watermark's update takes about 15 µs, and load sustains about 48,000
+events a second end to end, queue `get()` included (appendix). Live tail
+usually runs under 1,000 events a second, so per-event commits leave load
+around fifty times its live rate.
+
+Rates near that ceiling arise only in catch-up, when a resumed session replays
+from the watermark as fast as the pipeline reads; backfills have been seen at
+48,000 events a second. Backpressure keeps catch-up safe at whatever rate the
+pipeline sustains, and it gains on the live stream by that rate less the live
+one.
+
+A commit that fails on the environment — a full disk, an I/O error — raises,
+ending load and with it the session (§2). The watermark makes a rerun safe.
+
+Load is the store's only writer. It connects through the standard library's
+`sqlite3`, so it imports no DuckDB.
+
+#### Latency
+
+Pulse measures two latencies, each ending when load's `COMMIT` returns, since a
+commit is when an event becomes visible to readers:
+
+- **Pipeline latency** (`pipeline_latency`), from extract's receipt stamp to the
+  commit. Both ends read `CLOCK_MONOTONIC`, one clock for the whole system
+  (§4.2), so the figure is exact. It covers both queue waits, transform's work
+  and the transaction.
+- **End-to-end latency** (`e2e_latency`), from the source's own commit to
+  Pulse's. A commit event's `rev` is the repository revision, a TID the PDS
+  generates as it commits the change: 13 characters of sortable base32 carrying
+  53 bits of microseconds since the Unix epoch, then a 10-bit clock id.
+  Transform decodes it, and load subtracts it from `time.time_ns()` at commit.
+  It crosses machines, so it is only as good as the PDS's clock sync.
+
+The rkey is a TID for most collections too, but it marks when the *record* was
+minted: an update or delete keeps its original rkey, and would read as the
+record's whole age. `rev` marks when the *event* happened, for creates, updates
+and deletes alike. Identity and account events carry no `rev`, and an event
+whose `rev` fails to decode loses only its end-to-end latency. An end-to-end
+latency below zero means the PDS's clock runs ahead of Pulse's.
+
+Each is written to load's section as the latest value, and the TUI shows what it
+samples. At live rates latency is steady from one event to the next, so a sample
+reads true. During catch-up, end-to-end latency reads as the age of the events
+being replayed, which is how far behind the live stream Pulse still is.
+
+The dashboard's refresh interval comes on top of both figures. That is the
+delay an operator sees on the page, and it is a setting, fixed in the config.
+
+#### The watermark
+
+The watermark is the seq of the newest event committed. It lives in the store,
+in a one-row table holding the seq and the Jetstream host that assigned it,
+updated in the same transaction as the event's rows. It is the resume position,
+and Pulse keeps no separate cursor file.
+
+The TUI reads it during bootstrap, through `sqlite3`, and hands it to extract at
+construction. A seq is assigned by the Jetstream instance serving the
+connection, and whether the two public instances number alike is unconfirmed
+(§7), so a session configured for a different host treats the watermark as
+stale.
+
+Everything in flight when a process dies — events in the queues, the one load
+was committing — sits past the watermark, and the next session re-fetches it, as
+long as the restart falls inside the lookback window. Within a session, the SDK
+tracks the cursor itself and drops the message each reconnect redelivers.
+
+The watermark is exact only while events travel in seq order, which one
+extract, one transform and one load joined by FIFO queues guarantee. Transform
+stays a single process for that reason. Parallel workers could commit seq 1000
+while seq 990 was still in flight, and a crash between the two would skip 990;
+parallelising transform means tracking the lowest seq still in flight.
 
 #### Stale cursors
 
@@ -563,21 +721,13 @@ the subscription. The SDK's own reconnects carry the cursor too, so the refusal
 can arrive mid-session as well as at startup: a laptop asleep for longer than
 the window wakes to it.
 
-Ingest catches the error, discards the cursor, reports the discontinuity to the
-TUI, and resubscribes from the live tip. Left uncaught, the error would end
-ingest and with it the tree.
+Extract catches the error, discards the cursor, reports the discontinuity to
+the TUI, and resubscribes from the live tip. Left uncaught, the error would end
+extract and with it the tree.
 
 A timestamp cursor (a value of 10^15 or more, read as unix microseconds)
 clamps up to the oldest retained event and would replay the whole window. Pulse
 resumes by seq alone.
-
-#### Transform
-
-One sealed segment maps to **one transaction**. On commit the segment moves into
-`spool/done/`, so any segment in the spool itself is unprocessed and crash
-recovery is a directory listing. `done/` is pruned by age, leaving a window in
-which a transform bug stays recoverable. A segment that fails to load moves to
-`spool/quarantine/`.
 
 #### An observation log
 
@@ -594,44 +744,53 @@ the observed window.
 
 #### Deduplication
 
-Jetstream delivers at-least-once: a resumed session replays its first event, and
-a crash between commit and the move to `done/` reprocesses a segment. Both
-redeliver *the same event*, so the idempotency key identifies an event rather
-than a record. The seq serves directly, and it is what a replay repeats.
+Jetstream delivers at-least-once, along two paths, and each is closed where it
+arises:
 
-A record's `at://` URI (DID, collection, rkey) identifies a record across its
-lifetime, so a create and a later update of one post share it while remaining
-two distinct events. The URI is a grouping dimension for queries; event identity
-is what deduplication keys on.
+- **A resumed session.** The server replays inclusively from the cursor, so a
+  resumed session's first message is the event at the watermark, already
+  stored. Extract skips any message at or below the watermark.
+- **A reconnect within a session.** The SDK drops the message each reconnect
+  redelivers (Backpressure, above).
 
-Deduplication happens once, at the DuckLake write, so the layers above stay
-simple. DuckLake rejects `PRIMARY KEY` and `UNIQUE` constraints, so the write is
-an anti-join against stored rows whose seq falls in the segment's range. Because
-seq is monotonic, Parquet min/max statistics exclude every older file, keeping
-the check proportional to the segment.
+A crash adds no third path: the watermark commits with the event, so no event is
+ever both committed and re-fetched, and the store needs no deduplication pass of
+its own.
 
-#### DuckLake
+The seq identifies an *event*. A record's `at://` URI (DID, collection, rkey)
+identifies a *record* across its lifetime, so a create and a later update of
+one post share it while remaining two distinct events. The URI is a grouping
+dimension for queries.
 
-SQLite catalog, Parquet data. The SQLite catalog takes two extensions,
-`ducklake` and `sqlite_scanner`, both installed into an `extension_directory`
-pinned inside Pulse's cache directory. The pin is a per-connection setting, so
-every DuckDB connection in every process sets it. A connection without it
-autoinstalls into `~/.duckdb/extensions`, outside anything uninstall removes.
-`temp_directory` is pinned into the cache directory for the same reason, since
-an in-memory connection otherwise spills into `.tmp` under the working
-directory.
+#### SQLite and the dashboard's reader
 
-Segment-sized commits produce roughly 720 files and 720 snapshots an hour.
-Compaction is a maintenance step of its own, run on a schedule, in three parts:
+The store is one SQLite database in WAL mode, with `synchronous=NORMAL`. In WAL
+mode a commit appends to the write-ahead log and readers see it as soon as it
+lands, without blocking the writer or being blocked by it. `NORMAL` syncs the
+log at checkpoints only, so a power loss can lose the last few commits while the
+database stays consistent; the watermark is lost with them, and the next session
+re-fetches those events.
 
-1. `ducklake_merge_adjacent_files` writes merged files beside the originals,
-   which older snapshots still reference
-2. `ducklake_expire_snapshots` releases those snapshots
-3. `ducklake_cleanup_old_files` deletes the files they held
+Tables are declared `STRICT`. An ordinary SQLite column takes a value of any
+type — text in an `INTEGER` column is stored as text — and DuckDB's reader then
+fails the query that meets it. A STRICT table refuses that value at the write,
+where transform's casting should already have caught it.
 
-Merging alone raises the file count (appendix). Expiry ends time travel past its
-horizon, and cleanup runs with a grace period longer than the slowest dashboard
-query, which may still be reading an expired snapshot.
+The dashboard reads through DuckDB, attaching the database read-only with the
+`sqlite_scanner` extension, so analytical SQL runs in DuckDB over SQLite's
+rows. The extension is installed into an `extension_directory` pinned inside
+Pulse's cache directory. The pin is a per-connection setting, and a connection
+without it autoinstalls into `~/.duckdb/extensions`, outside anything uninstall
+removes. `temp_directory` is pinned into the cache directory for the same
+reason, since an in-memory connection otherwise spills into `.tmp` under the
+working directory.
+
+SQLite folds the log back into the database at a checkpoint, run automatically
+once the log passes 1,000 pages. A checkpoint can only fold in what no open
+read still needs, so a reader that never closes its read transaction holds the
+log growing, one commit at a time, without an error anywhere. The dashboard's
+reads are therefore short, one query at a time, and the log's size is watched
+(§6).
 
 ### 4.5 Storage layout
 
@@ -646,8 +805,8 @@ including a test's.
 
 | Contents | Location |
 |---|---|
-| DuckLake catalog, Parquet, JSONL spool with `done/` and `quarantine/`, lockfile | `user_data_dir` |
-| DuckDB extensions (`ducklake`, `sqlite_scanner`), DuckDB temp files, marker file | `user_cache_dir` |
+| SQLite database with its WAL and shared-memory files, the watermark inside it, lockfile | `user_data_dir` |
+| DuckDB's `sqlite_scanner` extension, DuckDB temp files, marker file | `user_cache_dir` |
 | Child stdout/stderr, marker file | `user_log_dir` |
 
 These three directories hold everything Pulse writes, which is what lets
@@ -659,10 +818,9 @@ pointing into `/mnt/c` would move them onto the Windows filesystem, where
 `flock`, atomic rename and `fsync` pass through a translation layer outside
 this design's testing.
 
-The JSONL spool sits under `user_data_dir` although its contents are
-short-lived: a pending segment holds the only copy of its events once they age
-past the lookback window. Cache directories are cleared by users and tools as a
-matter of routine.
+Events in flight live in memory alone, in the data queues.
+The watermark makes Jetstream's retention the pipeline's backlog (§4.4), so the
+disk holds committed data and nothing waiting to load.
 
 ### 4.6 Module layout
 
@@ -683,10 +841,10 @@ tree.
   inside `run()`
 
 The entry module shares `__init__.py`'s universal reach, since the console
-script's module-level import runs in every child. A module-level
-`from pulse.tui import ...` there would reach the three child modules through
-the TUI's spawning code, seating every heavy dependency in every process; that
-import belongs in the body of `main()`.
+script's module-level import runs in every child. A module-level `from pulse.tui
+import ...` there would reach the four child modules through the TUI's spawning
+code, seating every heavy dependency in every process; that import belongs in
+the body of `main()`.
 
 `pulse/__main__.py` sits outside that path, since `multiprocessing.spawn`
 returns early for a module whose name ends in `.__main__`, leaving a child under
@@ -705,10 +863,10 @@ Textual canvas. Each child redirects both streams in `PulseProcess.run()`, and
 Config is one frozen dataclass in `config.py`, `frozen=True, slots=True,
 kw_only=True`, and nothing about it varies from the command line or the
 environment. Its fields carry every tunable with its default in view: the
-collection filters, the seal interval, the sampling window, queue capacities,
-join deadlines, the Jetstream endpoint. The three path fields default through
-`default_factory` to `platformdirs`, with `ensure_exists=False`, so they are
-computed when a config is constructed.
+collection filters, the drain's quiet interval, the sampling window, queue
+capacities, join deadlines, the Jetstream endpoint. The three path fields
+default through `default_factory` to `platformdirs`, with `ensure_exists=False`,
+so they are computed when a config is constructed.
 
 `cli.main()` constructs it once, as `Config()`, and the TUI passes that instance
 to every child alongside the channels bundle. Children use that instance
@@ -717,19 +875,19 @@ since `frozen` guards rebinding alone and a list field stays mutable.
 `__post_init__` validates, catching a bad value where it enters.
 
 The tunables are fields because tests must change them in spawned children: a
-short seal interval, short join deadlines, a stub that overruns its deadline in
-seconds. A test patching a module constant
-changes it only in its own process, since each child re-imports `config.py`
-into a fresh interpreter. A config passed down reaches every child: a test
-constructs `Config(seal_interval=0.1, join_deadline=2.0)` and hands it in.
-Values no test would change, such as the application name and the lockfile's
-name, stay as module constants.
+short quiet interval, short join deadlines, a stub that overruns its deadline
+in seconds. A test patching a module constant changes it only in its own
+process, since each child re-imports `config.py` into a fresh interpreter. A
+config passed down reaches every child: a test constructs
+`Config(quiet_interval=0.1, join_deadline=2.0)` and hands it in. Values no test
+would change, such as the application name and the lockfile's name, stay as
+module constants.
 
 `config.py` holds no config instance at module level. `cli.py` imports it at
 module level, so every child imports it too, and unpickling the config a child
 receives needs it anyway. A module-level instance would re-run resolution in
-every child, and would look like one shared config while being four
-independent copies.
+every child, and would look like one shared config while being five independent
+copies.
 
 Tests keep Pulse out of the real home directory through the environment
 `platformdirs` reads. A test points `HOME` at `tmp_path` and clears
@@ -835,7 +993,8 @@ behaviour stable across interpreter versions.
 **Daemonic children.** The obvious way to have children die with their parent.
 Rejected on two counts: daemonic children are terminated only when the parent
 exits *normally*, leaving them orphaned by a crash or a kill; and termination
-offers no cleanup window, while ingest must seal its open segment.
+offers no cleanup window, while the pipeline drains and load makes its final
+commit.
 
 **`PR_SET_PDEATHSIG` or polling `os.getppid()`.** Both detect orphaning without
 a pipe. `PR_SET_PDEATHSIG` is Linux-only and fires on the death of the *thread*
@@ -845,22 +1004,79 @@ reaper forever. File descriptor state is definitive where a sampled integer is
 approximate, so the liveness pipe won.
 
 **Supervised restart.** Rejected because the transient failures it would
-address are already handled inside ingest. The SDK reconnects a dropped
-websocket from its cursor, and ingest catches a cursor that has aged out
-(§4.4). A dead ingest *process* therefore signals a bug, which restarting
-conceals. The three children also want different policies: ingest restarts
-cheaply but loses lookback window while down, transform restarts safely because
-DuckLake rolls back and the segment survives until commit, and the dashboard is
-cosmetic. Three policies wearing one name suggests the feature is premature.
+address are already handled inside extract. The SDK reconnects a dropped
+websocket from its cursor, and extract catches a cursor that has aged out
+(§4.4). A dead pipeline *process* therefore signals a bug, which restarting
+conceals. The children also want different policies: extract restarts cheaply
+but loses lookback window while down, transform and load restart safely because
+SQLite rolls back and the watermark stays at the last commit, and the
+dashboard is cosmetic. Several policies wearing one name suggests the feature
+is premature.
+
+### Pipeline
+
+**A JSONL spool between ingest and one etl process.** The earlier design:
+ingest appended events to a JSONL segment sealed every 5 seconds by fsync and
+atomic rename, and a single etl process loaded one sealed segment per
+transaction, moving it to `done/` on commit or `quarantine/` on failure. The
+resume cursor came from the newest sealed segment, and an anti-join on seq at
+the write absorbed a segment reprocessed after a crash.
+
+Replaced by three processes joined by queues. Each stage now has one job, and
+events stream through the pipeline one at a time. The watermark committed with
+the rows gives crash recovery without segment bookkeeping, and closes both
+redelivery paths where they arise, so the anti-join, the spool directories and
+the segment writer all go.
+
+The spool held two properties the pipeline gives up. Its backlog was bounded by
+the disk, so ingest never waited on a slow load; a stall now waits upstream and
+is safe only inside Jetstream's lookback window (§4.4). And `done/` kept raw
+input after loading, so a transform bug could be fixed and the segments
+reloaded; now the raw input survives only in Jetstream's retention. Both were
+weighed against a live-tail tool whose data is rarely malformed and whose
+stalls are short.
+
+**A shared-memory ring buffer for the data queues.** A single-producer,
+single-consumer ring over `multiprocessing.shared_memory` would carry items
+without pickling. Rejected because it is substantial custom code whose failures
+are subtle — a record read while half-written, a mishandled wraparound — while
+`Queue` already carries about 112,000 items a second per hop (appendix).
+
+**DuckLake as the store.** The previous design: a lakehouse with Parquet data
+and a SQLite catalog, loaded one transaction per 5-second batch, with
+compaction run by load between commits. Replaced because near-real-time
+availability means committing each event, and every DuckLake commit writes a
+Parquet file and a snapshot: thousands of each a minute at firehose rates, with
+compaction running constantly behind them. SQLite in WAL mode commits an event
+in about 15 µs and shows it to readers at once, and DuckDB still runs the
+analytical SQL, attaching the database read-only.
+
+What that gives up: columnar storage, which scans large aggregations faster
+than SQLite's rows, and the lakehouse's own features — time travel across
+snapshots, and Parquet files other tools read directly. Revisit if dashboard
+queries over a long observed history grow slow.
+
+**Batched queue items and interval commits.** The previous pipeline: extract
+batched messages by size and age, and load committed every 5 seconds. It paid
+pickling once per batch and wrote fewer, larger transactions. Replaced because
+every event then waited on its batch and its commit interval before any reader
+saw it. Measured per-item costs — about 112,000 queue items and 67,000 SQLite
+transactions a second (appendix) — leave the firehose well inside what one
+event at a time sustains.
+
+**Parallel transform workers.** Transform is the stage doing per-event Python
+work, so it is the natural one to parallelise. Rejected while one worker keeps
+up, because events would then commit out of seq order and the newest committed
+seq would stop being a safe watermark (§4.4).
 
 ### Inter-process communication
 
 **One duplex pipe carrying everything.** The original design, with status,
 control and logs on a single connection per child. Rejected because `send()`
 blocks once the OS buffer fills, and the resulting chain — slow TUI stops
-draining, ingest blocks, websocket falls behind, cursor passes the lookback
-window — converts a rendering delay into permanent data loss. Moving counters to
-shared memory removes the channel the chain depends on.
+draining, the pipeline blocks, the websocket falls behind, the cursor passes the
+lookback window — converts a rendering delay into permanent data loss. Moving
+counters to shared memory removes the channel the chain depends on.
 
 **Locked shared counters.** `Value(..., lock=True)` guards against concurrent
 writers. Rejected because each counter has exactly one writer by construction,
@@ -917,7 +1133,7 @@ it.
 
 **The dashboard as an optional extra.** Streamlit and its transitive
 dependencies account for roughly 101 MiB of the 143 MiB dependency set, so
-`pulse[dashboard]` would cut first-run download from ~167 MiB to ~66 MiB.
+`pulse[dashboard]` would cut first-run download from ~154 MiB to ~53 MiB.
 Rejected because the saving is a one-time twelve seconds on a 100 Mbit link,
 paid against a degraded-mode code path in the TUI and a second installation
 story to document.
@@ -947,25 +1163,26 @@ browser tab and the first-run email prompt.
 
 Uninstall (§4.3) removes all three directories in full, which is why
 `extension_directory` and `temp_directory` are pinned inside Pulse's cache
-directory. The DuckDB extensions are fetched from DuckDB's repository during
+directory. The DuckDB extension is fetched from DuckDB's repository during
 bootstrap. Jetstream records arrive as decoded JSON from a third party and are
 treated as data throughout, reaching the TUI only as projected text.
 
 ### Observability
 
 The TUI is the primary instrument. Counters and heartbeats give per-stage
-throughput and liveness, the log pane carries lifecycle events and errors from
+throughput and liveness, sampled latencies give pipeline and end-to-end latency
+(§4.4), the log pane carries lifecycle events and errors from
 every process as structured records (§4.8), and child stdout and stderr are
 redirected to `user_log_dir` for anything that escapes the logging path.
 
 ### Resource bounds
 
 Memory is bounded by construction: fixed-size shared memory, bounded queues,
-a bounded `RichLog`, and a fixed-length sample window in the TUI. The spool is
-bounded by the move on commit and the age pruning of `done/`. The store grows
-with every observed event, and its retention is an open question (§7).
-The hot path is a memory increment per event, with the feed rate-limited by
-time.
+a bounded `RichLog`, and a fixed-length sample window in the TUI. On disk, the
+WAL is bounded by checkpoints, as long as no reader holds one open (§4.4). The
+store grows with every observed event, and its retention is an open question
+(§7). Per event, the hot path is a counter increment and a queue hop in each
+stage, then one SQLite transaction, with the feed rate-limited by time.
 
 ### Failure modes that present as silence
 
@@ -975,20 +1192,28 @@ These fail silently, which is why each carries a named countermeasure.
 |---|---|
 | Liveness pipe whose write end is held elsewhere | The stop flag, set by any child detecting EOF |
 | A process killed while holding a `multiprocessing` lock | No lock on the stop path; every join has a deadline |
-| A writer's exit held by an unread queue | The TUI drains all session; an orphaned child cancels its queue joins |
+| A writer's exit held by an unread queue | The TUI drains the log and feed queues all session; a dead downstream stage is bounded by the join deadline; an orphaned child cancels its queue joins |
+| A message discarded by extract's handler | The handler keeps every message and waits on a full queue, since the SDK's cursor has already passed it |
+| A stage draining for an end marker that never comes | The drain also ends once the stop flag is set and the input has stayed empty for the quiet interval |
+| The WAL growing behind a reader that never lets a checkpoint finish | Short dashboard reads, one query at a time; the WAL's size shown in the TUI |
+| A value SQLite stores that DuckDB's reader rejects | Casting in transform; STRICT tables refusing a mistyped value at the write |
+| Upstream schema drift dropping a collection's events | Transform's `dropped` total, read by the TUI |
 | A wedged child, its counters flat | Heartbeat age, read by the TUI |
+
 | Log queue overflowing | `raiseExceptions` disabled, drop-on-full, bounded capacity |
 | A child writing over the TUI canvas | stdout and stderr redirected in `PulseProcess.run()`; nothing logs at import time, before structlog is configured |
 | A `multiprocessing` object created inside the running app | All channels created before `app.run()` (§4.3) |
 | Terminal signals reaching children | SIGINT and SIGHUP ignored in `PulseProcess.run()` |
-| Cursor ageing past the lookback window | `JetstreamCursorTooOldError` caught in ingest; discontinuity reported in the TUI |
+| Cursor ageing past the lookback window | `JetstreamCursorTooOldError` caught in extract; discontinuity reported in the TUI |
 
 ---
 
 ## 7. Open questions
 
 - A layout version marker for the data directory, and the migration path
-- Which process schedules DuckLake compaction
+- Pickling cost of the SDK's message models across the raw queue at firehose
+  rates, and whether extract should hand over plain dicts instead
+- The dashboard's refresh interval, which sets how fresh the data looks
 - Retention for the store, which otherwise grows with every observed event
 - Handle resolution for the feed: whether to resolve, where, and with what cache
 - Whether seq is comparable across the two public Jetstream instances
@@ -1008,11 +1233,9 @@ Measured 2026-09-22 on Python 3.14.7, DuckDB 1.5.5, over a 100 Mbit connection.
 | `import duckdb` | 0.07s |
 | Shared counter increment, lock-free | 80 ns |
 | Shared counter increment, locked | 304 ns |
-| DuckLake extension, on the wire | 12.1 MiB (34.7 MiB on disk) |
-| DuckLake extension, cold install | 1.36s |
 | Full dependency set | 142.7 MiB across 58 packages |
 | Streamlit's share of that set | ~101 MiB |
-| First run, total download | ~155 MiB, ~17s, before `sqlite_scanner` was counted |
+| First run, total download | ~155 MiB, ~17s, when the `ducklake` extension (12.1 MiB) was fetched in place of `sqlite_scanner` |
 
 Roughly 16 of those 17 seconds belong to uv fetching packages before the
 interpreter starts. The bootstrap phase the TUI controls runs a few seconds,
@@ -1024,12 +1247,18 @@ Measured 2026-09-23 on the same versions.
 |---|---|
 | `import structlog` (26.1.0) | 0.10s |
 | `sqlite_scanner` extension, on the wire | 11.7 MiB (33.2 MiB on disk) |
-| First run, total download, both extensions counted | ~167 MiB |
+| First run, total download, `sqlite_scanner` alone | ~154 MiB |
 | `Event.set()` after SIGKILL of a child polling `is_set()` | Blocked for good in 89 of 150 trials |
-| DuckLake, 60 single-insert commits | 60 Parquet files, 62 snapshots |
-| After `ducklake_merge_adjacent_files` | 61 files, 63 snapshots |
-| After `ducklake_expire_snapshots` and `ducklake_cleanup_old_files` | 1 file, 1 snapshot |
 | Three children spawned from a Textual worker thread, channels created before `app.run()`, headless and under a real pty | All ran and exited 0 |
 | Signal mask those children inherited from the worker thread | Nothing blocked (`SigBlk` 0) |
 | Liveness pipes and lock duplicates passed from the worker, write ends closed later from the main thread | Every child saw EOF; the lock stayed held until the last child exited |
 | A `Queue` created inside the running app | `ValueError: bad value(s) in fds_to_keep` |
+| SQLite 3.53.4, WAL, `synchronous=NORMAL`: transactions of two inserts and a watermark update | 67,022 a second, ~15 µs each |
+| The same with `synchronous=FULL`, under WSL2 | 59,648 a second; WSL2's virtual disk makes fsync cheap, so bare metal will be slower |
+| `multiprocessing.Queue`, one plain dict per item, one hop between spawned processes | ~112,000 items a second |
+| One load process: queue `get()`, then a transaction of two inserts into STRICT tables and a watermark update, per event | 48,484 events a second |
+| DuckDB 1.5.5 attaching a STRICT, WAL-mode SQLite database read-only, a writer committing beside it | Each commit visible to the next query: median 0.84 ms, max 1.11 ms over 200 commits |
+| `sqlite_scanner`, install and load into a pinned `extension_directory` | 1.78s cold |
+| A STRICT `INTEGER` column given text | Refused: `cannot store TEXT value in INTEGER column` |
+| An ordinary `INTEGER` column given text | Stored as text |
+| `sqlite3` binding a lone surrogate / an int past 64 bits | `UnicodeEncodeError` / `OverflowError` |

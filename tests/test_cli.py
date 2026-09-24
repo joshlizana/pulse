@@ -1,3 +1,5 @@
+import dataclasses
+import queue
 import subprocess
 import sys
 from pathlib import Path
@@ -102,8 +104,37 @@ def test_app_runs_once_under_the_lock(home, app_runs):
 def test_app_receives_shared_channels(home, app_runs):
     main([])
     channels = app_runs[0]["app"].channels
-    for name in ("counter", "stop_event", "heartbeat"):
-        assert is_shared(getattr(channels, name)), name
+    for field in dataclasses.fields(channels):
+        assert is_shared(getattr(channels, field.name)), field.name
+
+
+CAPACITIES = {"logs": 2, "feed": 3, "raw": 4, "rows": 5}
+
+
+def test_queues_hold_exactly_their_configured_capacity(home, app_runs, monkeypatch):
+    """Each queue refuses the item after its capacity, so none is unbounded.
+
+    A queue built with no size, or a size of zero or less, holds any number of
+    items and fails quietly: raw and rows would never block, and backpressure
+    would never reach extract.
+    """
+    import pulse.cli
+
+    small = Config(
+        log_queue_maxsize=CAPACITIES["logs"],
+        feed_queue_maxsize=CAPACITIES["feed"],
+        raw_queue_maxsize=CAPACITIES["raw"],
+        rows_queue_maxsize=CAPACITIES["rows"],
+    )
+    monkeypatch.setattr(pulse.cli, "Config", lambda: small)
+    main([])
+    channels = app_runs[0]["app"].channels
+    for name, capacity in CAPACITIES.items():
+        q = getattr(channels, name)
+        for i in range(capacity):
+            q.put_nowait(i)
+        with pytest.raises(queue.Full):
+            q.put_nowait(capacity)
 
 
 def test_empty_argv_ignores_the_real_command_line(home, app_runs, monkeypatch):
