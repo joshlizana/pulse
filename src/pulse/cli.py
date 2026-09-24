@@ -1,11 +1,16 @@
 import ctypes
 import enum
+import logging
 import multiprocessing
 import sys
 
 from pulse.channels import Channels, Extract, Transform, Load, Dashboard
 from pulse.config import Config
 from pulse.lock import AlreadyRunningError, FileLock
+from pulse.logging import configure_logging
+
+logging.raiseExceptions = False
+logging.basicConfig(level=logging.INFO)
 
 
 class ExitCode(enum.IntEnum):
@@ -49,9 +54,18 @@ def main(argv: list[str] | None = None) -> int:
                 raw=ctx.Queue(config.raw_queue_maxsize),
                 rows=ctx.Queue(config.rows_queue_maxsize),
             )
+
+            logger = configure_logging(
+                log_file_path=config.log_dir,
+                name="cli"
+            )
+
+
+            logger.info("Starting Pulse CLI")
             from pulse.app import Pulse
             app = Pulse(channels=channels)
             app.run()
+            logger.info("Pulse CLI has stopped")
     except AlreadyRunningError as e:
         print(e, file=sys.stderr)
         return ExitCode.ALREADY_RUNNING

@@ -1,3 +1,4 @@
+import enum
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,7 +22,19 @@ class Config:
             "pulse", ensure_exists=False
         )
     )
+    log_dir: Path = field(
+        default_factory=lambda: platformdirs.user_log_path(
+            "pulse", ensure_exists=False
+        )
+    )
     log_queue_maxsize: int = 1000
     feed_queue_maxsize: int = 100
     raw_queue_maxsize: int = 100000
     rows_queue_maxsize: int = 100000
+
+    processes: enum.Enum = field(
+        default_factory=lambda: enum.Enum(
+            "Processes",
+            ["EXTRACT", "TRANSFORM", "LOAD", "DASHBOARD"]
+        )
+    )

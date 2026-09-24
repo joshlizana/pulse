@@ -12,7 +12,7 @@ class FileLock:
         self.lock_file = data_dir / "pulse.lock"
         self.file = open(self.lock_file, "a")
 
-    def acquire(self):
+    def acquire(self) -> None:
         try:
             fcntl.flock(self.file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -22,12 +22,12 @@ class FileLock:
                 "Please close it before starting a new one."
             ) from None
 
-    def release(self):
+    def release(self) -> None:
         self.file.close()
 
-    def __enter__(self):
+    def __enter__(self) -> "FileLock":
         self.acquire()
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.release()
