@@ -1,5 +1,5 @@
 import ctypes
-from datalasses import dataclass
+from dataclasses import dataclass
 
 
 class Counter(ctypes.Structure):
@@ -11,8 +11,8 @@ class Counter(ctypes.Structure):
 
 class Heartbeat(ctypes.Structure):
     _fields_ = [
-        ("ingest", ctypes.c_int),
-        ("etl", ctypes.c_int),
+        ("ingest", ctypes.c_double),
+        ("etl", ctypes.c_double),
     ]
 
 

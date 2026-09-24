@@ -1,7 +1,7 @@
 import ctypes
 import enum
+import multiprocessing
 import sys
-from multiprocessing import spawn_context
 
 from pulse.channels import Channels, Counter, Heartbeat
 from pulse.config import Config
@@ -30,18 +30,18 @@ def parse_args(argv: list[str], config: Config) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    ctx = multiprocessing.get_context("spawn")
     config = Config()
 
     parse_args(argv if argv is not None else sys.argv[1:], config=config)
 
-    channels = Channels(
-        counter=Counter(ingest=0, etl=0),
-        stop_event=ctypes.c_bool(False),
-        heartbeat=Heartbeat(ingest=0, etl=0),
-    )
-
     try:
         with FileLock(config.data_dir):
+            channels = Channels(
+                counter=ctx.RawValue(Counter),
+                stop_event=ctx.RawValue(ctypes.c_bool),
+                heartbeat=ctx.RawValue(Heartbeat),
+            )
             from pulse.app import Pulse
             app = Pulse(channels=channels)
             app.run()

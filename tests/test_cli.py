@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import created
+from conftest import created, is_shared, lock_is_free
 from pulse.cli import ExitCode, main
 from pulse.config import Config
 
@@ -63,7 +63,27 @@ def test_unknown_argument_is_a_usage_error(home, capsys):
     assert created(home) == []
 
 
-def test_run_creates_only_the_data_directory_and_lockfile(home):
+@pytest.fixture
+def app_runs(monkeypatch):
+    """Replace the TUI's run with a stand-in that records what it was given.
+
+    The startup path runs for real: config, lock, channels and the app's
+    construction. The stand-in also records whether the lock was held while the
+    app ran.
+    """
+    from pulse.app import Pulse
+
+    runs = []
+
+    def run(app):
+        held = not lock_is_free(Config().data_dir)
+        runs.append({"app": app, "lock_held": held})
+
+    monkeypatch.setattr(Pulse, "run", run)
+    return runs
+
+
+def test_run_creates_only_the_data_directory_and_lockfile(home, app_runs):
     assert main([]) == ExitCode.SUCCESS
     assert created(home) == [
         ".local",
@@ -73,7 +93,20 @@ def test_run_creates_only_the_data_directory_and_lockfile(home):
     ]
 
 
-def test_empty_argv_ignores_the_real_command_line(home, monkeypatch):
+def test_app_runs_once_under_the_lock(home, app_runs):
+    main([])
+    assert len(app_runs) == 1
+    assert app_runs[0]["lock_held"]
+
+
+def test_app_receives_shared_channels(home, app_runs):
+    main([])
+    channels = app_runs[0]["app"].channels
+    for name in ("counter", "stop_event", "heartbeat"):
+        assert is_shared(getattr(channels, name)), name
+
+
+def test_empty_argv_ignores_the_real_command_line(home, app_runs, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["pytest", "--not-a-pulse-option"])
     assert main([]) == ExitCode.SUCCESS
 
