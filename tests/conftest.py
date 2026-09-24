@@ -1,3 +1,6 @@
+import fcntl
+import multiprocessing.queues
+import os
 import signal
 
 import pytest
@@ -40,3 +43,27 @@ def home(tmp_path, monkeypatch):
 def created(root):
     """Every path created under root, relative to it."""
     return sorted(p.relative_to(root).as_posix() for p in root.rglob("*"))
+
+
+def lock_is_free(data_dir):
+    """Whether a fresh open of the data directory's lockfile can take the lock."""
+    fd = os.open(data_dir / "pulse.lock", os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def is_shared(obj):
+    """Whether an object can reach a spawned child as a `Process` argument.
+
+    A multiprocessing queue always can. A ctypes object can only when it lives
+    in multiprocessing shared memory: `multiprocessing.sharedctypes` attaches the
+    shared block as `_wrapper`, and pickling the object for a child relies on it.
+    """
+    if isinstance(obj, multiprocessing.queues.Queue):
+        return True
+    return hasattr(obj, "_wrapper")

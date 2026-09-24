@@ -35,3 +35,23 @@ def test_fields_override_by_keyword(tmp_path):
 def test_fields_are_keyword_only(tmp_path):
     with pytest.raises(TypeError):
         Config(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "log_queue_maxsize",
+        "feed_queue_maxsize",
+        "raw_queue_maxsize",
+        "rows_queue_maxsize",
+    ],
+)
+@pytest.mark.parametrize("size", [0, -1])
+def test_queue_capacity_below_one_is_refused(field, size):
+    """A queue given a size of zero or less has no bound at all.
+
+    `multiprocessing` reads such a size as unlimited, so a config meant to make
+    a queue tiny would switch off its backpressure instead.
+    """
+    with pytest.raises(ValueError, match=field):
+        Config(**{field: size})

@@ -1,21 +1,9 @@
-import fcntl
 import os
 
 import pytest
 
-from conftest import created
+from conftest import created, lock_is_free
 from pulse.lock import AlreadyRunningError, FileLock
-
-
-def lock_is_free(data_dir):
-    fd = os.open(data_dir / "pulse.lock", os.O_RDWR)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except BlockingIOError:
-        return False
-    finally:
-        os.close(fd)
 
 
 def test_creates_the_data_directory_and_lockfile(tmp_path):
